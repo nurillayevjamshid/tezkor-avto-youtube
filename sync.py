@@ -50,8 +50,6 @@ def get_youtube_client():
 
 def upload_to_youtube(youtube, video_path, title, description):
     print(f"[YouTube] Video yuklanmoqda: {title}")
-
-    # YouTube Shorts uchun sarlavha 100 belgidan oshmasligi kerak
     if "#Shorts" not in title and "#shorts" not in title:
         short_title = f"{title[:90]} #Shorts"
     else:
@@ -60,9 +58,9 @@ def upload_to_youtube(youtube, video_path, title, description):
     body = {
         "snippet": {
             "title": short_title,
-            "description": description,
-            "tags": ["Tezkor", "Yangiliklar", "Shorts", "Reels"],
-            "categoryId": "25"  # News & Politics
+            "description": f"{description}\n\n#tezkor #yangiliklar #shorts",
+            "tags": ["tezkor", "yangiliklar", "shorts", "tezkor_official"],
+            "categoryId": "25"
         },
         "status": {
             "privacyStatus": "public",
@@ -72,7 +70,7 @@ def upload_to_youtube(youtube, video_path, title, description):
 
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
     request = youtube.videos().insert(
-        part="snippet,status",
+        part=",".join(body.keys()),
         body=body,
         media_body=media
     )
@@ -81,225 +79,136 @@ def upload_to_youtube(youtube, video_path, title, description):
     while response is None:
         status, response = request.next_chunk()
         if status:
-            print(f"[YouTube] Yuklanish: {int(status.progress() * 100)}%")
+            print(f"[YouTube] Yuklanish jarayoni: {int(status.progress() * 100)}%")
 
     print(f"[YouTube] Muvaffaqiyatli yuklandi! Video ID: {response.get('id')}")
     return response.get('id')
 
-def get_instagram_reels_via_playwright(username, max_reels=5):
-    print(f"[Playwright] Instagram @{username} profilidan Reels qidirilmoqda...")
+def get_latest_reels_via_playwright(username, limit=3):
+    print(f"[Playwright] @{username} profilidan Reels olinmoqda...")
     reels = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu"
-            ]
-        )
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            locale="uz-UZ"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = context.new_page()
-        try:
-            url = f"https://www.instagram.com/{username}/reels/"
-            print(f"[Playwright] Kirilmoqda: {url}")
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
+        profile_url = f"https://www.instagram.com/{username}/"
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(3)
 
-            # Linklarni olish
-            links = page.locator('a[href*="/reel/"], a[href*="/reels/"]').all()
-            seen_ids = set()
-            for link in links:
+        links = page.locator('a[href*="/reel/"], a[href*="/p/"]').all()
+        shortcodes = []
+        for l in links:
+            href = l.get_attribute("href") or ""
+            parts = [p for p in href.split("/") if p]
+            if len(parts) >= 2 and parts[0] in ("reel", "p"):
+                sc = parts[1]
+                if sc not in shortcodes:
+                    shortcodes.append(sc)
+            elif len(parts) >= 3 and parts[1] in ("reel", "p"):
+                sc = parts[2]
+                if sc not in shortcodes:
+                    shortcodes.append(sc)
+
+        print(f"[Playwright] Topilgan post/reel shortcodes: {shortcodes[:limit]}")
+
+        for sc in shortcodes[:limit]:
+            reel_url = f"https://www.instagram.com/reel/{sc}/"
+            try:
+                page.goto(reel_url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
+                video_el = page.locator("video").first
+                video_src = None
+                if video_el.is_visible(timeout=5000):
+                    video_src = video_el.get_attribute("src")
+
+                page_title = page.title()
+                desc = page_title
                 try:
-                    href = link.get_attribute("href")
-                    if not href:
-                        continue
-                    parts = [p.strip() for p in href.strip("/").split("/") if p.strip()]
-                    reel_id = None
-                    for idx, part in enumerate(parts):
-                        if part in ("reel", "reels") and idx + 1 < len(parts):
-                            reel_id = parts[idx + 1]
-                            break
-                    if reel_id and reel_id not in seen_ids:
-                        seen_ids.add(reel_id)
-                        reels.append({
-                            "id": reel_id,
-                            "url": f"https://www.instagram.com/reel/{reel_id}/"
-                        })
-                        if len(reels) >= max_reels:
-                            break
-                except Exception as ex:
-                    print(f"[Playwright] Link o'qishda xatolik: {ex}")
+                    h1 = page.locator("h1").first
+                    if h1.is_visible(timeout=2000):
+                        desc = h1.inner_text()
+                except Exception:
+                    pass
 
-            print(f"[Playwright] Topilgan Reels soni: {len(reels)}")
-        except Exception as e:
-            print(f"[Playwright] Reels ro'yxatini olishda xatolik: {e}")
-        finally:
-            browser.close()
+                reels.append({
+                    "shortcode": sc,
+                    "url": reel_url,
+                    "video_url": video_src,
+                    "caption": desc
+                })
+            except Exception as e:
+                print(f"[Playwright] Postni ochishda xato ({sc}): {e}")
+
+        browser.close()
     return reels
 
-def download_reel(url, video_id):
-    # 1. yt-dlp orqali sinab ko'rish
-    output_template = f"downloads/{video_id}.%(ext)s"
-    dl_cmd = [
-        sys.executable, "-m", "yt_dlp",
-        url,
-        "-o", output_template,
-        "--write-info-json",
-        "--quiet",
-        "--no-warnings"
-    ]
-    try:
-        subprocess.run(dl_cmd, check=True)
-        video_files = glob.glob(f"downloads/{video_id}.*")
-        video_file = next((f for f in video_files if not f.endswith(".json")), None)
-        if video_file and os.path.exists(video_file):
-            title = "Tezkor Yangilik"
-            description = "Tezkor OFFICIAL yangiliklari"
-            info_file = f"downloads/{video_id}.info.json"
-            if os.path.exists(info_file):
-                try:
-                    with open(info_file, "r", encoding="utf-8") as f:
-                        info_data = json.load(f)
-                    desc = info_data.get("description", "")
-                    if desc:
-                        description = desc
-                        title = desc.split("
-")[0][:90]
-                except Exception:
-                    pass
-            return video_file, title, description
-    except Exception as e:
-        print(f"[yt-dlp] Yuklab bo'lmadi ({e}), Playwright fallback ishga tushmoqda...")
+def download_video(url, output_path):
+    print(f"[Download] Video yuklab olinmoqda: {url[:60]}...")
+    resp = requests.get(url, stream=True, timeout=60, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    })
+    resp.raise_for_status()
+    with open(output_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    print(f"[Download] Saqlandi: {output_path}")
 
-    # 2. Playwright orqali to'g'ridan-to'g'ri video src va sarlavhani olish
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
-        try:
-            print(f"[Playwright] Reel sahifasiga kirilmoqda: {url}")
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3000)
-
-            video_el = page.locator("video").first
-            video_src = video_el.get_attribute("src") if video_el.count() > 0 else None
-
-            title = "Tezkor Yangilik"
-            description = "Tezkor OFFICIAL yangiliklari"
-            for sel in ['h1', 'span[dir="auto"]']:
-                elements = page.locator(sel).all()
-                for el in elements:
-                    try:
-                        txt = el.inner_text().strip()
-                        if len(txt) > 20:
-                            description = txt
-                            title = txt.split("
-")[0][:90]
-                            break
-                    except Exception:
-                        pass
-                if description != "Tezkor OFFICIAL yangiliklari":
-                    break
-
-            if video_src:
-                video_file = f"downloads/{video_id}.mp4"
-                resp = requests.get(video_src, stream=True, timeout=30)
-                if resp.status_code == 200:
-                    with open(video_file, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=1024*1024):
-                            f.write(chunk)
-                    return video_file, title, description
-        except Exception as e:
-            print(f"[Playwright] Yuklab olishda xatolik: {e}")
-        finally:
-            browser.close()
-
-    return None, None, None
-
-def check_and_sync():
-    print(f"[Sync] Instagram akkaunti tekshirilmoqda: @{INSTAGRAM_USERNAME}")
+def main():
+    print(f"=== Instagram to YouTube Sync boshlandi ({datetime.now()}) ===")
     history = load_history()
+    print(f"Oldingi yuklangan videolar soni: {len(history)}")
 
-    os.makedirs("downloads", exist_ok=True)
+    try:
+        youtube = get_youtube_client()
+        print("[YouTube] API mijoz muvaffaqiyatli ulandi.")
+    except Exception as e:
+        print(f"[YouTube XATO] API mijozni ishga tushirib bo'lmadi: {e}")
+        sys.exit(1)
 
-    reels = get_instagram_reels_via_playwright(INSTAGRAM_USERNAME, max_reels=5)
-
+    reels = get_latest_reels_via_playwright(INSTAGRAM_USERNAME, limit=3)
     if not reels:
-        print("[Sync] Playwright topa olmadi, yt-dlp fallback bilan tekshirilmoqda...")
-        cmd = [
-            sys.executable, "-m", "yt_dlp",
-            f"https://www.instagram.com/{INSTAGRAM_USERNAME}/reels/",
-            "--playlist-items", "1:5",
-            "--dump-json",
-            "--flat-playlist",
-            "--quiet",
-            "--no-warnings"
-        ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            lines = proc.stdout.strip().split("
-")
-            for line in lines:
-                if not line:
-                    continue
-                try:
-                    item = json.loads(line)
-                    v_id = item.get("id") or item.get("url", "").split("/")[-2]
-                    v_url = item.get("url") or f"https://www.instagram.com/reel/{v_id}/"
-                    if v_id:
-                        reels.append({"id": v_id, "url": v_url})
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[Xato] yt-dlp fallback xatosi: {e}")
+        print("[Instagram] Hech qanday reel/video topilmadi.")
+        return
 
-    youtube = None
-    new_found = 0
-
-    for item in reels:
-        video_id = item["id"]
-        url = item["url"]
-
-        if video_id in history:
-            print(f"[Tekshiruv] {video_id} avval yuklangan, o'tkazib yuborildi.")
+    new_count = 0
+    for reel in reels:
+        sc = reel["shortcode"]
+        if sc in history:
+            print(f"Post [{sc}] allaqachon yuklangan, o'tkazib yuboriladi.")
             continue
 
-        print(f"[Yangi video topildi!] ID: {video_id}, Manzil: {url}")
-
-        video_file, title, description = download_reel(url, video_id)
-        if not video_file or not os.path.exists(video_file):
-            print(f"[Xato] Video yuklanmadi: {video_id}")
+        video_url = reel.get("video_url")
+        if not video_url:
+            print(f"Post [{sc}] uchun video URL topilmadi, o'tkazib yuboriladi.")
             continue
 
-        if youtube is None:
-            youtube = get_youtube_client()
+        desc = reel.get("caption") or f"Tezkor yangilik {sc}"
+        title_lines = [l.strip() for l in desc.splitlines() if l.strip()]
+        title = title_lines[0] if title_lines else f"Tezkor Yangilik {sc}"
+        if len(title) > 90:
+            title = title[:87] + "..."
 
+        temp_file = f"temp_{sc}.mp4"
         try:
-            yt_id = upload_to_youtube(youtube, video_file, title, description)
-            history.append(video_id)
+            download_video(video_url, temp_file)
+            yt_id = upload_to_youtube(youtube, temp_file, title, desc)
+            history.append(sc)
             save_history(history)
-            new_found += 1
-            print(f"[Tayyor] Instagram {video_id} -> YouTube {yt_id}")
+            new_count += 1
+            print(f"[SUCCESS] Post [{sc}] YouTube'ga muvaffaqiyatli yuklandi: https://youtu.be/{yt_id}")
+            break
         except Exception as e:
-            print(f"[Xato] YouTube'ga yuklashda xatolik yuz berdi: {e}")
+            print(f"[XATO] Post [{sc}] yuklashda xatolik: {e}")
         finally:
-            for f in glob.glob(f"downloads/{video_id}.*"):
+            if os.path.exists(temp_file):
                 try:
-                    os.remove(f)
+                    os.remove(temp_file)
                 except Exception:
                     pass
 
-    print(f"[Tugatildi] Hammasi tekshirildi. Yangi yuklangan videolar soni: {new_found}")
+    print(f"=== Yakunlandi. Yangi yuklangan videolar: {new_count} ta ===")
 
 if __name__ == "__main__":
-    check_and_sync()
+    main()
