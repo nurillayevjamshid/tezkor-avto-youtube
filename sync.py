@@ -100,6 +100,9 @@ def get_latest_reels_via_playwright(username, limit=3):
         links = page.locator('a[href*="/reel/"], a[href*="/p/"]').all()
         shortcodes = []
         for l in links:
+            
+
+
             href = l.get_attribute("href") or ""
             parts = [p for p in href.split("/") if p]
             if len(parts) >= 2 and parts[0] in ("reel", "p"):
