@@ -1,21 +1,19 @@
 import os
+import re
 import sys
 import json
 import glob
 import subprocess
-import time
-import requests
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from playwright.sync_api import sync_playwright
 
 HISTORY_FILE = "history.json"
-DEFAULT_USER = "tezkor.official"
-env_user = os.environ.get("INSTAGRAM_USERNAME", DEFAULT_USER).strip()
-INSTAGRAM_USERNAME = DEFAULT_USER if env_user in ("tezkor_official", "") else env_user
+INSTAGRAM_USERNAME = os.environ.get("INSTAGRAM_USERNAME", "tezkor.official")
+INSTAGRAM_SESSIONID = os.environ.get("INSTAGRAM_SESSIONID")
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -50,6 +48,7 @@ def get_youtube_client():
 
 def upload_to_youtube(youtube, video_path, title, description):
     print(f"[YouTube] Video yuklanmoqda: {title}")
+    
     if "#Shorts" not in title and "#shorts" not in title:
         short_title = f"{title[:90]} #Shorts"
     else:
@@ -58,9 +57,9 @@ def upload_to_youtube(youtube, video_path, title, description):
     body = {
         "snippet": {
             "title": short_title,
-            "description": f"{description}\n\n#tezkor #yangiliklar #shorts",
-            "tags": ["tezkor", "yangiliklar", "shorts", "tezkor_official"],
-            "categoryId": "25"
+            "description": description,
+            "tags": ["Tezkor", "Yangiliklar", "Shorts", "Reels"],
+            "categoryId": "25"  # News & Politics
         },
         "status": {
             "privacyStatus": "public",
@@ -70,7 +69,7 @@ def upload_to_youtube(youtube, video_path, title, description):
 
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
     request = youtube.videos().insert(
-        part=",".join(body.keys()),
+        part="snippet,status",
         body=body,
         media_body=media
     )
@@ -79,139 +78,159 @@ def upload_to_youtube(youtube, video_path, title, description):
     while response is None:
         status, response = request.next_chunk()
         if status:
-            print(f"[YouTube] Yuklanish jarayoni: {int(status.progress() * 100)}%")
+            print(f"[YouTube] Yuklanish: {int(status.progress() * 100)}%")
 
     print(f"[YouTube] Muvaffaqiyatli yuklandi! Video ID: {response.get('id')}")
-    return response.get('id')
+    return response.get("id")
 
-def get_latest_reels_via_playwright(username, limit=3):
-    print(f"[Playwright] @{username} profilidan Reels olinmoqda...")
+def get_latest_reels_via_browser(username):
+    print(f"[Browser] @{username} profilidagi so'nggi reels postlarini qidirish...")
     reels = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
-        profile_url = f"https://www.instagram.com/{username}/"
-        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(3)
-
-        links = page.locator('a[href*="/reel/"], a[href*="/p/"]').all()
-        shortcodes = []
-        for l in links:
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
             
+            # Agar sessionid bo'lsa, uni cookie sifatida qo'shamiz
+            if INSTAGRAM_SESSIONID:
+                print("[Browser] Instagram sessionid cookie qo'llanilmoqda...")
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                context.add_cookies([{
+                    "name": "sessionid",
+                    "value": INSTAGRAM_SESSIONID,
+                    "domain": ".instagram.com",
+                    "path": "/"
+                }])
+                page = context.new_page()
+            else:
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                page = context.new_page()
 
-
-            href = l.get_attribute("href") or ""
-            parts = [p for p in href.split("/") if p]
-            if len(parts) >= 2 and parts[0] in ("reel", "p"):
-                sc = parts[1]
-                if sc not in shortcodes:
-                    shortcodes.append(sc)
-            elif len(parts) >= 3 and parts[1] in ("reel", "p"):
-                sc = parts[2]
-                if sc not in shortcodes:
-                    shortcodes.append(sc)
-
-        print(f"[Playwright] Topilgan post/reel shortcodes: {shortcodes[:limit]}")
-
-        for sc in shortcodes[:limit]:
-            reel_url = f"https://www.instagram.com/reel/{sc}/"
+            url = f"https://www.instagram.com/{username}/"
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(4000)
+            
+            # Login modal yoki cookie banner chiqsa, uni yopishga urinish
             try:
-                page.goto(reel_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
-                video_el = page.locator("video").first
-                video_src = None
-                if video_el.is_visible(timeout=5000):
-                    video_src = video_el.get_attribute("src")
+                for selector in ["[role='dialog'] svg[aria-label='Close']", "button:has-text('Not Now')", "button:has-text('Dismiss')", "button:has-text('Close')"]:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=1500):
+                        btn.click()
+            except Exception:
+                pass
 
-                page_title = page.title()
-                desc = page_title
+            # Sahifadagi barcha reel va post havolalarini topish
+            anchors = page.locator("a[href*='/reel/'], a[href*='/p/']").all()
+            for a in anchors:
                 try:
-                    h1 = page.locator("h1").first
-                    if h1.is_visible(timeout=2000):
-                        desc = h1.inner_text()
+                    href = a.get_attribute("href")
+                    if href:
+                        match = re.search(r'/(?:reel|p)/([A-Za-z0-9_-]+)', href)
+                        if match:
+                            code = match.group(1)
+                            if code not in reels:
+                                reels.append(code)
                 except Exception:
                     pass
 
-                reels.append({
-                    "shortcode": sc,
-                    "url": reel_url,
-                    "video_url": video_src,
-                    "caption": desc
-                })
-            except Exception as e:
-                print(f"[Playwright] Postni ochishda xato ({sc}): {e}")
-
-        browser.close()
+            browser.close()
+    except Exception as e:
+        print(f"[Browser Xatolik] Playwright orqali sahifani yuklashda xatolik: {e}")
     return reels
 
-def download_video(url, output_path):
-    print(f"[Download] Video yuklab olinmoqda: {url[:60]}...")
-    resp = requests.get(url, stream=True, timeout=60, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    })
-    resp.raise_for_status()
-    with open(output_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print(f"[Download] Saqlandi: {output_path}")
-
-def main():
-    print(f"=== Instagram to YouTube Sync boshlandi ({datetime.now()}) ===")
+def check_and_sync():
+    print(f"[Sync] Instagram akkaunti tekshirilmoqda: @{INSTAGRAM_USERNAME}")
     history = load_history()
-    print(f"Oldingi yuklangan videolar soni: {len(history)}")
-
-    try:
-        youtube = get_youtube_client()
-        print("[YouTube] API mijoz muvaffaqiyatli ulandi.")
-    except Exception as e:
-        print(f"[YouTube XATO] API mijozni ishga tushirib bo'lmadi: {e}")
-        sys.exit(1)
-
-    reels = get_latest_reels_via_playwright(INSTAGRAM_USERNAME, limit=3)
+    
+    os.makedirs("downloads", exist_ok=True)
+    
+    # 1. Playwright orqali reels havolalarini qidiramiz
+    reels = get_latest_reels_via_browser(INSTAGRAM_USERNAME)
+    print(f"[Reels] Topilgan postlar soni: {len(reels)} (Kodlar: {reels[:5]})")
+    
     if not reels:
-        print("[Instagram] Hech qanday reel/video topilmadi.")
+        print("[Ogohlantirish] Yangi postlar topilmadi.")
         return
 
-    new_count = 0
-    for reel in reels:
-        sc = reel["shortcode"]
-        if sc in history:
-            print(f"Post [{sc}] allaqachon yuklangan, o'tkazib yuboriladi.")
+    youtube = None
+    new_found = 0
+
+    for video_id in reels[:5]:
+        url = f"https://www.instagram.com/reel/{video_id}/"
+
+        if video_id in history:
+            print(f"[Tekshiruv] {video_id} avval yuklangan, o'tkazib yuborildi.")
             continue
 
-        video_url = reel.get("video_url")
-        if not video_url:
-            print(f"Post [{sc}] uchun video URL topilmadi, o'tkazib yuboriladi.")
-            continue
-
-        desc = reel.get("caption") or f"Tezkor yangilik {sc}"
-        title_lines = [l.strip() for l in desc.splitlines() if l.strip()]
-        title = title_lines[0] if title_lines else f"Tezkor Yangilik {sc}"
-        if len(title) > 90:
-            title = title[:87] + "..."
-
-        temp_file = f"temp_{sc}.mp4"
+        print(f"[Yangi video topildi!] ID: {video_id}, Manzil: {url}")
+        
+        # yt-dlp yordamida videoni yuklab olish
+        output_template = f"downloads/{video_id}.%(ext)s"
+        dl_cmd = [
+            sys.executable, "-m", "yt_dlp",
+            url,
+            "-o", output_template,
+            "--write-info-json",
+            "--quiet",
+            "--no-warnings"
+        ]
+        if INSTAGRAM_SESSIONID:
+            dl_cmd.extend(["--add-header", f"Cookie: sessionid={INSTAGRAM_SESSIONID}"])
+        
         try:
-            download_video(video_url, temp_file)
-            yt_id = upload_to_youtube(youtube, temp_file, title, desc)
-            history.append(sc)
-            save_history(history)
-            new_count += 1
-            print(f"[SUCCESS] Post [{sc}] YouTube'ga muvaffaqiyatli yuklandi: https://youtu.be/{yt_id}")
-            break
+            subprocess.run(dl_cmd, check=True)
         except Exception as e:
-            print(f"[XATO] Post [{sc}] yuklashda xatolik: {e}")
+            print(f"[Xato] Videoni yuklab olishda muammo: {e}")
+            continue
+
+        # Yuklangan faylni topish
+        video_files = glob.glob(f"downloads/{video_id}.*")
+        video_file = next((f for f in video_files if not f.endswith(".json")), None)
+        info_file = f"downloads/{video_id}.info.json"
+
+        if not video_file or not os.path.exists(video_file):
+            print(f"[Xato] Video fayli topilmadi: {video_id}")
+            continue
+
+        title = "Tezkor Yangilik"
+        description = "Tezkor OFFICIAL yangiliklari"
+        if os.path.exists(info_file):
+            with open(info_file, "r", encoding="utf-8") as f:
+                info_data = json.load(f)
+                desc = info_data.get("description", "")
+                if desc:
+                    description = desc
+                    # Faqat birinchi xatboshini olamiz va 90 belgidan oshirmaymiz
+                    first_para = desc.split("\n")[0].strip()
+                    title = first_para[:90]
+
+        # YouTube ga yuklash
+        if youtube is None:
+            youtube = get_youtube_client()
+
+        try:
+            yt_id = upload_to_youtube(youtube, video_file, title, description)
+            history.append(video_id)
+            save_history(history)
+            new_found += 1
+            print(f"[Tayyor] Instagram {video_id} -> YouTube {yt_id}")
+        except Exception as e:
+            print(f"[Xato] YouTube'ga yuklashda xatolik yuz berdi: {e}")
         finally:
-            if os.path.exists(temp_file):
+            # Fayllarni tozalash (joyni tejash uchun)
+            for f in glob.glob(f"downloads/{video_id}.*"):
                 try:
-                    os.remove(temp_file)
+                    os.remove(f)
                 except Exception:
                     pass
 
-    print(f"=== Yakunlandi. Yangi yuklangan videolar: {new_count} ta ===")
+    print(f"[Tugatildi] Sinxronizatsiya yakunlandi. Yangi yuklangan videolar soni: {new_found}")
 
 if __name__ == "__main__":
-    main()
+    check_and_sync()
